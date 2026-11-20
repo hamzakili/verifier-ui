@@ -45,9 +45,13 @@ export function createVerificationService({ config, registry }) {
   const resultsCache = new Map(); // jobId -> results payload
   const finalizing = new Map(); // jobId -> Promise (dedupes concurrent results fetches)
 
-  /** Mode for the active provider: mock if requested, or if the provider has no key. */
-  function resolve(requestedMode) {
-    const provider = registry.getActive();
+  /**
+   * Mode for the active provider: mock if requested, or if the provider has no key.
+   * `providerOverride` pins a specific provider (bulk verification jobs keep the provider
+   * they were created with, even if the active provider is switched mid-job).
+   */
+  function resolve(requestedMode, providerOverride) {
+    const provider = providerOverride && registry.isValid(providerOverride) ? providerOverride : registry.getActive();
     const mode = !registry.isConfigured(provider) || requestedMode === 'mock' ? 'mock' : 'live';
     return { provider, mode, adapter: mode === 'live' ? live[provider] : mock[provider] };
   }
@@ -79,6 +83,20 @@ export function createVerificationService({ config, registry }) {
   return {
     resolve,
 
+    /** The adapter for a provider + mode, or null when that provider has no key (live). */
+    adapterFor: (provider, mode) => (mode === 'live' ? live[provider] : mock[provider]) || null,
+
+    /**
+     * Re-attach to a live provider job created earlier (e.g. before a server restart). Provider
+     * jobs are stateless from this service's point of view, so this only rebuilds the public id.
+     */
+    resumeBulkJob({ provider, rawId }) {
+      if (!live[provider]) {
+        throw new ApiError(409, 'provider_not_configured', `${registry.nameOf(provider)} is no longer configured; the job cannot be resumed.`);
+      }
+      return { provider, mode: 'live', jobId: `${JOB_PREFIX[provider]}_${rawId}`, duplicate: false };
+    },
+
     async credits(requestedMode) {
       const { provider, mode, adapter } = resolve(requestedMode);
       const c = await adapter.getCredits();
@@ -91,22 +109,27 @@ export function createVerificationService({ config, registry }) {
       return { provider, mode, ...r };
     },
 
-    /** rows: [{ id, email }] — already de-duplicated and validated. */
-    async createBulkJob(rows, filename, requestedMode) {
-      const { provider, mode, adapter } = resolve(requestedMode);
+    /**
+     * rows: [{ id, email }] — already de-duplicated and validated.
+     * options.provider pins the provider (default: the active one).
+     * Returns providerJobRef (the provider's own job id) for live jobs so callers can re-attach.
+     */
+    async createBulkJob(rows, filename, requestedMode, { provider: pinned } = {}) {
+      const { provider, mode, adapter } = resolve(requestedMode, pinned);
 
       // Prevent duplicate submissions of the same list while a job for it is still running.
       const fp = fingerprint(provider, mode, rows);
       const existing = inflight.get(fp);
       if (existing && Date.now() - existing.at < INFLIGHT_TTL_MS) {
-        return { provider, mode, jobId: existing.jobId, duplicate: true };
+        const m = JOB_ID_RE.exec(existing.jobId);
+        return { provider, mode, jobId: existing.jobId, duplicate: true, providerJobRef: mode === 'live' && m ? m[3] : null };
       }
 
       const rawId = await adapter.createJob(rows, filename);
       const jobId = `${JOB_PREFIX[provider]}${mode === 'mock' ? '-mock' : ''}_${rawId}`;
       inflight.set(fp, { jobId, at: Date.now() });
       jobFingerprints.set(jobId, fp);
-      return { provider, mode, jobId, duplicate: false };
+      return { provider, mode, jobId, duplicate: false, providerJobRef: mode === 'live' ? rawId : null };
     },
 
     async bulkStatus(jobId) {

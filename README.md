@@ -99,6 +99,40 @@ Browser ──▶ Node backend (/api/verify/…, /api/registry/…) ──Bearer
 
 The **Email Registry** page (`/registry`) shows registry statistics, a searchable and filterable list of records (search, domain, status, result, provider, sort, pagination), and a read-only batch lookup.
 
+## Bulk Verification Jobs
+
+**Bulk Verification Jobs** (`/bulk-jobs`) verifies up to **1,000 leads per import** in the background, batch by batch, and saves every finished batch to a folder you choose. You don't need to keep the page open or export anything by hand:
+
+**Import → split into batches → verify batch → save results → next batch → … → summary → completed**
+
+1. **Import.** Upload a CSV. The server parses and validates it and enforces the 1,000-lead limit; 1,001+ rows are rejected. The email column is detected automatically and you can change it. The preview shows each row's format and duplicate status, plus a summary of imported, unique, duplicate, empty, invalid-format and eligible rows. Every column is kept in the results. Excel files must be saved as CSV first.
+2. **Batches.** Choose 100, 250, 500 (default) or 1,000 emails per batch. The server calculates the batches; the last one may be smaller.
+3. **Destination folder.** Choose a folder, or create one or a subfolder. Each job writes into its own subfolder, e.g. `November Campaign / Job_20261120_001 /`.
+4. **Settings.** The job uses the current provider and live/mock mode, fixed for the whole job. Optionally give the job a name.
+5. **Review and start.** The job is saved, queued and returned immediately. Verification runs on the server.
+
+**How a batch runs:** each batch goes through the **existing verification engine** (`central.js`): registry lookup and reuse, one provider bulk job, and results saved back to the registry. Every lead's result is stored in the database, then `batch_NNN_verified.csv` is written and checked. Only then is the batch marked completed and the next batch started. When the last batch finishes, `all_results.csv` (every imported row in original order, duplicates included) and `verification_summary.csv` are generated.
+
+**Controls:**
+- **Pause:** the running batch finishes and is saved, then the job stops.
+- **Resume:** continues with the next unfinished batch.
+- **Cancel:** the running batch is saved and the rest are cancelled. Results and files are kept.
+- **Retry:** re-verifies only the failed records of a batch, or only re-saves its file if saving failed. Up to 5 retries per batch.
+
+**Errors:** a failure on one email doesn't fail its batch. Network, registry and provider rate-limit or 5xx errors are retried automatically with backoff. Permanent errors (for example no credits) stop the job with a clear message.
+
+**Restarts:** job state is persisted, so jobs survive a server restart. On start, interrupted jobs resume automatically. A batch that was in flight in live mode is re-attached to its provider job, so nothing is paid for twice, and completed records are never verified again.
+
+**Storage:**
+- Job state is stored in a local SQLite database (`server/data/bulk-verification.sqlite`) using Node's built-in `node:sqlite` (Node ≥ 22.13), so no extra dependency is needed.
+- Result files are stored in `server/storage/bulk-files/`. They are downloaded through the API only; file paths are never exposed.
+- Both folders are git-ignored.
+- Settings: `BULK_DB_FILE`, `BULK_STORAGE_DIR`, `BULK_MAX_CONCURRENT_JOBS` (default 1) and `BULK_POLL_MS` in `server/.env`.
+
+**Access:** this app has no user accounts. Every job, folder and file is still stored with an owner ID, and every query is scoped to it. To support multiple users, replace `resolveOwner` in `server/src/bulk/index.js` with the authenticated user or organization.
+
+**Related pages:** **Folders / Files** (`/files`) browses the folders and downloads any saved file. **Verification History** lists finished bulk jobs.
+
 ## Project structure
 
 ```
@@ -116,6 +150,15 @@ The **Email Registry** page (`/registry`) shows registry statistics, a searchabl
 │       │   ├── millionverifier.js  # MillionVerifier adapter (single, credits, bulk)
 │       │   └── neverbounceAdapter.js # wraps neverbounce.js / mock.js into the same interface
 │       ├── central.js              # email-first workflow: registry lookup → provider → save
+│       ├── bulk/                   # Bulk Verification Jobs (1,000-lead imports, batches, folders)
+│       │   ├── db.js               # SQLite schema + migrations (jobs, batches, leads, folders, files, imports)
+│       │   ├── importer.js         # CSV parsing, email-column detection, classification, batch plans
+│       │   ├── jobs.js             # job creation, views, pause/resume/cancel/retry state machine
+│       │   ├── runner.js           # background batch processor, retries, restart recovery
+│       │   ├── exporter.js         # CSV exports + private file storage (atomic, verified, idempotent)
+│       │   ├── folders.js          # logical folders (owner-scoped)
+│       │   ├── routes.js           # /api/bulk-verification/* and /api/verification-folders|files/*
+│       │   └── index.js            # wiring + owner resolution
 │       ├── services/
 │       │   ├── emailRegistryService.js # Laravel Email Registry API client (timeouts, retries, errors)
 │       │   ├── registryMapping.js      # app result ⇄ registry record mapping, normalization
@@ -126,7 +169,7 @@ The **Email Registry** page (`/registry`) shows registry statistics, a searchabl
 └── client/src/
     ├── context/                    # AppContext (providers, mode, credits, history), BulkContext, ToastContext
     ├── components/                 # Layout, Sidebar, ProviderSelector, Header, StatusBadge, …
-    ├── pages/                      # Dashboard, SingleVerifier, BulkVerifier, History, Registry
+    ├── pages/                      # Dashboard, SingleVerifier, BulkVerifier, BulkJobs, NewBulkJob, BulkJobDetail, Files, History, Registry
     └── lib/                        # api client, CSV helpers, status metadata, formatters
 ```
 
@@ -148,6 +191,21 @@ The **Email Registry** page (`/registry`) shows registry statistics, a searchabl
 | GET | `/api/registry/records/:id` | One record, or 404 |
 | POST | `/api/registry/lookup` | Body `{ emails[] }` (≤ 5,000) → `{ found, missing, invalid, summary }`. Read-only |
 | POST | `/api/mock/reset` | Resets both sandbox balances |
+| GET / POST | `/api/verification-folders` | List folders / create `{ folder_name, description?, parent_folder_id? }` |
+| GET / DELETE | `/api/verification-folders/:id` | Folder, subfolders, files and breadcrumb / delete (empty, unused folders only) |
+| GET | `/api/verification-files/:id/download` | Download a saved result file |
+| POST | `/api/bulk-verification/import` | Body `{ filename, content }` (CSV text, ≤ 10 MB, ≤ 1,000 rows) → preview, summary, detected column, `batch_plans` |
+| GET / PUT | `/api/bulk-verification/imports/:id` | Get an import / set `{ email_column }` |
+| GET | `/api/bulk-verification/plan` | `?eligible=&batch_size=` → batch sizes |
+| POST | `/api/bulk-verification/jobs` | Body `{ import_id, batch_size, destination_folder_id, job_name?, email_column?, verification?: { provider, mode }, start?, client_request_id? }`. Idempotent |
+| GET | `/api/bulk-verification/jobs` | Query `page, limit, search, status, from, to, sort, direction` → `{ jobs, meta, overview }` |
+| GET | `/api/bulk-verification/jobs/:id` and `…/progress` | Job, live progress and batches |
+| GET | `/api/bulk-verification/jobs/:id/batches/:batchId` | Batch + paginated per-lead results |
+| POST | `/api/bulk-verification/jobs/:id/{start,pause,resume,cancel}` | Job controls (409 for invalid transitions) |
+| POST | `/api/bulk-verification/jobs/:id/batches/:batchId/retry` | Retry failed records of a batch |
+| GET | `/api/bulk-verification/jobs/:id/batches/:batchId/download` / `/api/bulk-verification/jobs/:id/download` | Batch CSV / complete results CSV |
+
+See [API_ENDPOINTS.md](API_ENDPOINTS.md#part-3--bulk-verification-jobs) for payloads.
 
 The UI sends `x-verifier-mode: mock|live`. Bulk job IDs include the provider and mode (`mv_…`, `nb_…`, `mv-mock_…`), so a job keeps working even if you switch provider or mode while it runs. In the UI, switching provider is locked while a bulk job is running.
 
@@ -157,6 +215,7 @@ Errors are returned as `{ success: false, provider, error: { code, message, deta
 
 ```bash
 cd server && npm test
+cd client && npm test      # display helpers (folder tree, statuses)
 
 # against the real Laravel API (creates and then deletes records under a throwaway example.com subdomain)
 REGISTRY_IT_URL=http://127.0.0.1:8000/api REGISTRY_IT_TOKEN=<token> node --test test/registry.integration.test.js
@@ -165,7 +224,18 @@ REGISTRY_IT_URL=http://127.0.0.1:8000/api REGISTRY_IT_TOKEN=<token> node --test 
 pwsh -File scripts/test-registry-api.ps1
 ```
 
-The tests cover the registry workflow against an in-process double of the Laravel API (lookup-before-provider, reuse, save/upsert, mapping, outdated records, duplicates, mock isolation, registry down/429/401, token never exposed), the registry client (timeouts, retries, error mapping), provider selection and validation, MillionVerifier response and error mapping, the bulk upload/status/download flow, HTTP routes, duplicate-job prevention, and mock credit isolation. Upstream APIs are stubbed, so no credits are spent.
+The tests cover the registry workflow against an in-process double of the Laravel API (lookup-before-provider, reuse, save/upsert, mapping, outdated records, duplicates, mock isolation, registry down/429/401, token never exposed), the registry client (timeouts, retries, error mapping), provider selection and validation, MillionVerifier response and error mapping, the bulk upload/status/download flow, HTTP routes, duplicate-job prevention, and mock credit isolation.
+
+The Bulk Verification Jobs tests (`test/bulk.*.test.js`) cover:
+- import limits (100 / 1,000 / 1,001 rows), duplicates, empty and invalid emails, and batch splitting;
+- sequential processing where each batch is saved before the next starts, and progress reporting;
+- pause, resume, cancel and retry;
+- transient errors, permanent errors and storage failures;
+- recovery after a restart, including re-attaching to the provider job;
+- duplicate-job protection, owner isolation and path traversal;
+- end-to-end runs through the real engine, both live (stubbed MillionVerifier plus the registry double) and in the mock sandbox.
+
+Upstream APIs are stubbed, so no credits are spent.
 
 ## Mock sandbox patterns
 

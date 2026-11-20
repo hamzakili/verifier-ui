@@ -3,15 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Express proxy for MillionVerifier (default) and NeverBounce, with a built-in mock sandbox",
+  "description": "Express proxy for MillionVerifier (default) and NeverBounce, with a built-in mock sandbox and bulk verification jobs",
   "main": "src/index.js",
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js",
-    "test": "node --test \"test/**/*.test.js\""
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/index.js",
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\""
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=22.13"
   },
   "dependencies": {
     "cors": "^2.8.5",

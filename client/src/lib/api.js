@@ -81,4 +81,70 @@ export const api = {
   },
   registryRecord: (id) => request(`/api/registry/records/${encodeURIComponent(id)}`),
   registryLookup: (emails) => request('/api/registry/lookup', { method: 'POST', body: { emails } }),
+
+  // Verification folders / files
+  folders: () => request('/api/verification-folders'),
+  folder: (id) => request(`/api/verification-folders/${encodeURIComponent(id)}`),
+  createFolder: (body) => request('/api/verification-folders', { method: 'POST', body }),
+  deleteFolder: (id) => request(`/api/verification-folders/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // Bulk verification jobs (processed in the background by the server)
+  bulkImport: (filename, content) => request('/api/bulk-verification/import', { method: 'POST', body: { filename, content } }),
+  setImportColumn: (importId, emailColumn) =>
+    request(`/api/bulk-verification/imports/${encodeURIComponent(importId)}`, { method: 'PUT', body: { email_column: emailColumn } }),
+  createVerificationJob: (body) => request('/api/bulk-verification/jobs', { method: 'POST', body }),
+  verificationJobs: (params = {}, signal) => request(`/api/bulk-verification/jobs${query(params)}`, { signal }),
+  verificationJob: (id) => request(`/api/bulk-verification/jobs/${encodeURIComponent(id)}`),
+  verificationJobProgress: (id, signal) => request(`/api/bulk-verification/jobs/${encodeURIComponent(id)}/progress`, { signal }),
+  verificationBatch: (jobId, batchId, params = {}) =>
+    request(`/api/bulk-verification/jobs/${encodeURIComponent(jobId)}/batches/${encodeURIComponent(batchId)}${query(params)}`),
+  verificationJobAction: (id, action) => request(`/api/bulk-verification/jobs/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: {} }),
+  retryVerificationBatch: (jobId, batchId) =>
+    request(`/api/bulk-verification/jobs/${encodeURIComponent(jobId)}/batches/${encodeURIComponent(batchId)}/retry`, { method: 'POST', body: {} }),
+};
+
+function query(params) {
+  const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== '' && v != null)).toString();
+  return qs ? `?${qs}` : '';
+}
+
+/**
+ * Download a file from an API endpoint (batch CSV, complete results, folder file). Uses fetch so
+ * the same request headers (and any future auth) apply; the server never exposes file paths.
+ */
+export async function downloadFromApi(path, fallbackName = 'download.csv') {
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, { headers: { 'x-verifier-mode': preferredMode } });
+  } catch {
+    throw new ApiRequestError('Cannot reach the verifier server. Make sure it is running (npm run dev).', { code: 'network_error', retryable: true });
+  }
+  if (!res.ok) {
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiRequestError(data?.error?.message || `Download failed (HTTP ${res.status}).`, { status: res.status, code: data?.error?.code || 'http_error' });
+  }
+  const cd = res.headers.get('content-disposition') || '';
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+  const plain = /filename="([^"]+)"/i.exec(cd);
+  const name = star ? decodeURIComponent(star[1]) : plain ? plain[1] : fallbackName;
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export const downloadPaths = {
+  batch: (jobId, batchId) => `/api/bulk-verification/jobs/${encodeURIComponent(jobId)}/batches/${encodeURIComponent(batchId)}/download`,
+  job: (jobId) => `/api/bulk-verification/jobs/${encodeURIComponent(jobId)}/download`,
+  file: (fileId) => `/api/verification-files/${encodeURIComponent(fileId)}/download`,
 };

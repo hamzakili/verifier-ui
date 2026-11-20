@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Outlet, useLocation } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
-import Sidebar, { NAV_ITEMS } from './Sidebar';
+import Sidebar, { navItemFor } from './Sidebar';
 import Header from './Header';
 import { useApp } from '../context/AppContext';
 
@@ -9,7 +9,7 @@ export default function Layout() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const { pathname } = useLocation();
   const { server, refreshStatus, refreshAccount } = useApp();
-  const title = NAV_ITEMS.find((n) => (n.end ? pathname === n.to : pathname.startsWith(n.to)))?.label ?? 'MailVerify';
+  const title = navItemFor(pathname)?.label ?? 'MailVerify';
 
   return (
     <div className="min-h-screen">

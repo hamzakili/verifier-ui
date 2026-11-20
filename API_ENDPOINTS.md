@@ -386,3 +386,146 @@ Resets both mock sandbox balances.
 ```json
 { "ok": true }
 ```
+
+---
+
+# Part 3 — Bulk Verification Jobs
+
+Base URL `/api`, same conventions as Part 2: success responses have `success: true`, and errors are `{ success: false, error: { code, message, details? } }`. All routes are scoped to the caller's owner ID (single local owner in this app); another owner's resources return 404.
+
+## Folders and files
+
+### `POST /verification-folders`
+```json
+{ "folder_name": "November Campaign", "description": "Q4 leads", "parent_folder_id": null }
+```
+201:
+```json
+{ "success": true, "message": "Folder created.", "folder": { "id": "…", "folder_name": "November Campaign", "description": "Q4 leads",
+  "parent_folder_id": null, "is_job_folder": false, "path": "My Verification Files / November Campaign", "subfolder_count": 0, "file_count": 0,
+  "created_at": "…", "updated_at": "…" } }
+```
+Errors:
+- 422 `invalid_folder_name`: empty, more than 80 characters, or contains `/ \ : * ? " < > |`, control characters, `.` or `..`.
+- 409 `folder_exists`: a folder with that name already exists in the same parent (case-insensitive).
+- 404 `parent_folder_not_found`.
+
+### `GET /verification-folders`
+`{ "success": true, "folders": [folder, …] }`. The list is flat; build the tree from `parent_folder_id`. Add `?include_job_folders=false` to hide job output folders.
+
+### `GET /verification-folders/{id}`
+`{ "success": true, "folder": {…}, "subfolders": [...], "files": [{ "id", "kind", "file_name", "size_bytes", "row_count", "job_id", "batch_id", … }], "breadcrumb": [{ "id", "folder_name" }], "job": { "id", "job_name", "status" } | null }`
+
+`kind` is one of `batch`, `summary` or `all_results`.
+
+### `DELETE /verification-folders/{id}`
+Only empty folders that no job uses can be deleted. Otherwise the response is 409 `folder_not_empty` or `folder_in_use`.
+
+### `GET /verification-files/{id}/download`
+Returns the CSV (`text/csv; charset=utf-8`, UTF-8 BOM, CRLF) as an attachment. Returns 404 for unknown or foreign files, and 410 `file_missing` if the stored file was removed from disk.
+
+## Import
+
+### `POST /bulk-verification/import`
+```json
+{ "filename": "Campaign Leads.csv", "content": "first_name,email\nAva,ava@x.com\n…" }
+```
+201:
+```json
+{ "success": true, "import": {
+  "import_id": "…", "source_filename": "Campaign Leads.csv", "columns": ["first_name", "email"], "headerless": false,
+  "detected_email_column": "email", "email_column": "email", "email_column_required": false, "total_rows": 1000, "max_leads": 1000,
+  "summary": { "total_imported": 1000, "unique_emails": 985, "duplicates": 15, "empty": 0, "invalid_format": 0, "eligible": 985 },
+  "batch_sizes": [100, 250, 500, 1000], "default_batch_size": 500,
+  "batch_plans": { "500": { "batch_size": 500, "total_batches": 2, "batches": [500, 485] } },
+  "preview": [{ "row_number": 1, "email": "ava@x.com", "eligibility": "eligible", "duplicate_of_row": null, "data": { "first_name": "Ava", "email": "ava@x.com" } }],
+  "expires_at": "…" } }
+```
+- **Row eligibility:** `eligibility` is one of `eligible`, `duplicate`, `empty` or `invalid_format`. Only eligible rows are verified. A duplicate gets the result of its first occurrence.
+- **Email column not detected:** the response has `email_column_required: true` and `summary: null`. Set the column with `PUT /bulk-verification/imports/{id}` and the body `{ "email_column": "…" }`.
+- **Errors:**
+  - 413 `too_many_leads`: more than 1,000 rows.
+  - 413 `file_too_large`: more than 10 MB.
+  - 415 `unsupported_format`: Excel or other non-CSV files.
+  - 422 `empty_file` or `corrupted_file`.
+- Imports expire after 24 hours unless a job was created from them.
+
+### `GET /bulk-verification/plan?eligible=750&batch_size=500`
+`{ "success": true, "plan": { "batch_size": 500, "total_batches": 2, "batches": [500, 250] } }`
+
+## Jobs
+
+### `POST /bulk-verification/jobs`
+```json
+{ "import_id": "…", "batch_size": 500, "destination_folder_id": "…", "job_name": "November leads",
+  "verification": { "provider": "millionverifier", "mode": "live" }, "client_request_id": "a1b2c3" }
+```
+- **Response:** 201 with `{ success, message, duplicate: false, job }`. The job is created and queued, and verification runs in the background.
+- **Idempotency:** the same `import_id` or `client_request_id` returns the existing job with status 200 and `duplicate: true`.
+- **Optional fields:**
+  - `start: false` creates a `draft` job; start it later with `POST /bulk-verification/jobs/{id}/start`.
+  - If `job_name` is omitted, a name like `Campaign_Leads_November_20_2026` is generated.
+  - `verification` defaults to the active provider and the `x-verifier-mode` header.
+- **Errors:**
+  - 422 `validation_failed`: missing folder or bad batch size; field errors are in `details`.
+  - 422 `invalid_destination_folder`: the folder is not yours, or it is a job output folder.
+  - 422 `no_eligible_leads`.
+  - 409 `provider_not_configured`: live mode was requested for a provider without an API key.
+  - 404 `import_not_found`; 410 `import_expired`.
+
+### Job object (`GET /bulk-verification/jobs/{id}`, `GET …/progress`)
+```json
+{ "id": "…", "job_name": "…", "source_filename": "…", "status": "processing",
+  "destination_folder": { "id": "…", "folder_name": "November Campaign", "path": "My Verification Files / November Campaign" },
+  "job_folder": { "id": "…", "folder_name": "Job_20261120_001", "path": "… / Job_20261120_001" },
+  "total_imported": 1000, "total_eligible": 985, "total_duplicates": 15, "total_empty": 0, "total_invalid_format": 0,
+  "batch_size": 500, "total_batches": 2, "completed_batches": 1, "failed_batches": 0, "pending_batches": 1, "current_batch": 2,
+  "progress": { "processed": 650, "total": 985, "remaining": 335, "percent": 65.9 },
+  "counts": { "verified": 500, "failed": 0, "valid": 450, "invalid": 30, "disposable": 5, "catchall": 10, "unknown": 5, "reused": 120 },
+  "configuration": { "provider": "millionverifier", "provider_name": "MillionVerifier", "mode": "live", "registry": true, "auto_save": true, "auto_continue": true },
+  "error_message": null, "created_at": "…", "started_at": "…", "completed_at": null,
+  "files": [ { "id": "…", "kind": "all_results", "file_name": "all_results.csv", "size_bytes": 123, "row_count": 1000 } ],
+  "actions": { "can_start": false, "can_pause": true, "can_resume": false, "can_cancel": true, "can_download": true },
+  "batches": [ { "id": "…", "batch_number": 1, "total_emails": 500, "processed_count": 500, "verified_count": 500, "failed_count": 0,
+                 "valid_count": 450, "invalid_count": 30, "disposable_count": 5, "catchall_count": 10, "unknown_count": 5, "reused_count": 120,
+                 "status": "completed", "stage": null, "retry_count": 0, "error_kind": null, "error_message": null,
+                 "started_at": "…", "completed_at": "…", "duration_ms": 41230,
+                 "output_file": { "id": "…", "file_name": "batch_001_verified.csv", "size_bytes": 81234, "row_count": 500 }, "can_retry": false } ] }
+```
+- **Progress:** `progress` counts verified records, including the batch in flight, not batches.
+- **Polling:** poll `…/progress` while `status` is `queued`, `processing`, `pausing` or `cancelling`.
+- **Job status:** `draft`, `queued`, `processing`, `pausing`, `paused`, `completed`, `completed_with_errors`, `failed`, `cancelling` or `cancelled`.
+- **Batch status:** `pending`, `processing`, `saving`, `completed`, `failed`, `retrying` or `cancelled`.
+- **`error_kind`:** `verification`, `network`, `provider`, `queue` or `storage`.
+
+### `GET /bulk-verification/jobs`
+Query parameters:
+- `page`, `limit` (≤ 100).
+- `search`: matches the job name or file name.
+- `status`: one status or a comma-separated list.
+- `from`, `to`: creation dates.
+- `sort`: `created_at`, `job_name`, `status`, `total_eligible` or `progress`.
+- `direction`: `asc` or `desc`.
+
+Response: `{ success, jobs: [job], meta: { current_page, per_page, total, last_page }, overview: { total, completed, processing, paused, failed } }`
+
+### `GET /bulk-verification/jobs/{id}/batches/{batchId}?page=1&limit=100`
+`{ success, batch, results: [{ row_number, email, processing_status, verification_status, flags, suggested_correction, from_registry, note, error_message, verified_at }], meta }`
+
+### Controls
+| Route | Effect |
+|---|---|
+| `POST …/jobs/{id}/start` | `draft` → `queued`. Calling it again is safe. |
+| `POST …/jobs/{id}/pause` | `queued` → `paused`. `processing` → `pausing` → `paused` once the running batch is saved. |
+| `POST …/jobs/{id}/resume` | `paused` or `failed` → `queued`. Failed batches retry their unfinished records only. |
+| `POST …/jobs/{id}/cancel` | Running: → `cancelling`; the running batch is saved and the rest are cancelled. Otherwise: → `cancelled` immediately. |
+| `POST …/jobs/{id}/batches/{batchId}/retry` | A failed batch, or a completed batch with failed records: only those records are verified again, and the file is regenerated in place. Up to 5 retries. |
+
+Invalid transitions return 409 `invalid_transition`. Retry also returns 409 `nothing_to_retry` or `retry_limit_reached`.
+
+### Downloads
+`GET …/jobs/{id}/batches/{batchId}/download` returns the batch CSV, and `GET …/jobs/{id}/download` returns `all_results.csv`. Before the file exists, both return 409 `file_not_ready`.
+
+**Output columns:** every imported column, followed by `verification_status`, `verification_reason`, `verified_at`, `provider`, `is_valid`, `is_disposable`, `is_catch_all`, `is_role_based`, `is_free_email`, `suggested_correction` and `from_registry`. Imported columns with the same name are kept, and the added column gets a `_result` suffix. In mock mode, `provider` reads e.g. `MillionVerifier (mock sandbox)`.
+
+**Format:** values that start with `=`, `@` or similar formula characters are prefixed with `'` so Excel won't run them as formulas.

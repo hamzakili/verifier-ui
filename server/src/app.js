@@ -6,6 +6,7 @@ import { createVerificationService } from './verification.js';
 import { createCentralVerification } from './central.js';
 import { fromRegistryRecord, isUsable } from './services/registryMapping.js';
 import { createEmailRegistryService } from './services/emailRegistryService.js';
+import { createBulkModule } from './bulk/index.js';
 
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -47,8 +48,10 @@ const sourceOf = (req, fallback) => (SOURCES.includes(req.body?.source) ? req.bo
  * @param config  from loadConfig()
  * @param options.store  optional registry client (tests inject one); otherwise the Laravel Email
  *                       Registry API client is used when EMAIL_REGISTRY_API_URL / _TOKEN are set.
+ * @param options.bulk   Bulk Verification Jobs options for tests (dbFile, storageDir, resolveOwner,
+ *                       runner timings); `false` disables the module.
  */
-export function createApp(config, { store: injectedStore, centralTiming } = {}) {
+export function createApp(config, { store: injectedStore, centralTiming, bulk: bulkOptions } = {}) {
   const registry = createProviderRegistry(config);
   const service = createVerificationService({ config, registry });
   const store =
@@ -69,6 +72,8 @@ export function createApp(config, { store: injectedStore, centralTiming } = {}) 
   const app = express();
   app.disable('x-powered-by');
   app.use(cors({ origin: config.corsOrigins }));
+  // Lead imports carry the CSV text (<= 10 MB file); parsed here before the general 5 MB limit applies.
+  app.use('/api/bulk-verification/import', express.json({ limit: '12mb' }));
   app.use(express.json({ limit: '5mb' }));
 
   // --- health & status ----------------------------------------------------------
@@ -347,6 +352,22 @@ export function createApp(config, { store: injectedStore, centralTiming } = {}) 
     res.json({ ok: true });
   });
 
+  // --- bulk verification jobs + verification folders/files ------------------------
+
+  const bulk =
+    bulkOptions === false
+      ? null
+      : createBulkModule({
+          config,
+          central,
+          service,
+          providers: registry,
+          limiter: rateLimit({ windowMs: 60_000, max: 600 }), // progress polling + downloads; verification itself is paced by the runner
+          requestedMode,
+          options: bulkOptions || {},
+        });
+  if (bulk) app.use('/api', bulk.router);
+
   app.use('/api', (req, res) => {
     res.status(404).json({ success: false, error: { code: 'not_found', message: `No route for ${req.method} ${req.originalUrl}` } });
   });
@@ -367,5 +388,5 @@ export function createApp(config, { store: injectedStore, centralTiming } = {}) 
     send(isApi ? err.status : 500, err.code || 'internal_error', isApi ? err.message : 'Unexpected server error.', isApi && err.status === 422 ? err.details : undefined);
   });
 
-  return { app, registry, service, central, store };
+  return { app, registry, service, central, store, bulk };
 }

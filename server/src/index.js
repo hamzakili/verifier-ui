@@ -3,9 +3,9 @@ import { loadConfig } from './config.js';
 import { createApp } from './app.js';
 
 const config = loadConfig();
-const { app, registry, store } = createApp(config);
+const { app, registry, store, bulk } = createApp(config);
 
-app.listen(config.port, async () => {
+const server = app.listen(config.port, async () => {
   console.log(`\n  Verifier API listening on http://localhost:${config.port}`);
   for (const p of registry.list()) {
     const tag = p.available ? `LIVE (key ${registry.keyHint(p.id)})` : 'not configured — mock only';
@@ -25,6 +25,27 @@ app.listen(config.port, async () => {
     }
   }
 
+  if (bulk) {
+    // Resume bulk verification jobs that were running when the server last stopped.
+    const resumed = bulk.runner.recover();
+    console.log(`  ● Bulk verification jobs  ready${resumed ? ` — resuming ${resumed} interrupted job(s)` : ''}`);
+  }
+
   for (const w of config.warnings) console.warn(`  ! ${w}`);
   console.log('');
 });
+
+// Graceful shutdown: stop scheduling batches; job state stays in the database and is resumed on the next start.
+let shuttingDown = false;
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n  ${signal}: shutting down…`);
+    server.close();
+    const force = setTimeout(() => process.exit(0), 5_000);
+    force.unref();
+    await bulk?.close().catch(() => {});
+    process.exit(0);
+  });
+}

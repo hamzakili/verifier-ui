@@ -171,9 +171,14 @@ export function createCentralVerification({ service, store, options = {}, timing
     return { total: norms.length, reusable: usable.size, pendingElsewhere: pending, invalid: bad, toVerify: norms.length - usable.size - pending - bad };
   }
 
-  async function createBulkJob(rows, filename, requestedMode, { source = 'csv_import' } = {}) {
-    const { provider, mode, adapter } = service.resolve(requestedMode);
-    if (mode === 'mock') return service.createBulkJob(rows, filename, requestedMode); // sandbox: no registry
+  /**
+   * options.provider pins the provider (bulk verification jobs); default: the active provider.
+   * The result includes providerJobRef (the provider's own job id, live only) so a caller that
+   * persists it can re-attach with resumeBulkJob() after a restart instead of paying again.
+   */
+  async function createBulkJob(rows, filename, requestedMode, { source = 'csv_import', provider: pinned } = {}) {
+    const { provider, mode, adapter } = service.resolve(requestedMode, pinned);
+    if (mode === 'mock') return service.createBulkJob(rows, filename, requestedMode, { provider }); // sandbox: no registry
 
     const entries = [];
     const seen = new Set();
@@ -187,7 +192,8 @@ export function createCentralVerification({ service, store, options = {}, timing
     const fp = createHash('sha256').update(`${provider}|${mode}|`).update([...seen].sort().join('\n')).digest('hex');
     const runningId = fingerprints.get(fp);
     if (runningId && jobs.get(runningId) && !jobs.get(runningId).done) {
-      return { provider, mode, jobId: runningId, duplicate: true, ...summary(jobs.get(runningId)) };
+      const running = jobs.get(runningId);
+      return { provider, mode, jobId: runningId, duplicate: true, providerJobRef: running.providerRawId, ...summary(running) };
     }
 
     const { usable, invalid, checked } = await findUsable([...seen]);
@@ -243,7 +249,74 @@ export function createCentralVerification({ service, store, options = {}, timing
     jobs.set(job.id, job);
     fingerprints.set(fp, job.id);
     schedule(job, toProvider.length ? T.pollMs : 0);
-    return { provider, mode, jobId: job.id, duplicate: false, ...summary(job) };
+    return { provider, mode, jobId: job.id, duplicate: false, providerJobRef: job.providerRawId, ...summary(job) };
+  }
+
+  /**
+   * Re-attach to a live provider job created before this process started (the in-memory job is
+   * gone after a restart, but the provider still holds the job and its results). The results are
+   * fetched and saved to the registry exactly like a new job's, so nothing is paid for twice.
+   * rows: the emails of that batch. Emails the registry already holds are reused (they may never
+   * have been sent to that provider job); the rest are expected in the provider job's results.
+   */
+  async function resumeBulkJob({ provider, rawId, rows, source = 'csv_import' }) {
+    const adapter = service.adapterFor(provider, 'live');
+    if (!adapter) throw new ApiError(409, 'provider_not_configured', 'The provider for this job is no longer configured; it cannot be resumed.');
+
+    const entries = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const normalized = normalizeEmail(r.email);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      entries.push({ email: r.email.trim(), normalized });
+    }
+    const fp = createHash('sha256').update(`${provider}|live|resume|${rawId}`).digest('hex');
+    const runningId = fingerprints.get(fp);
+    if (runningId && jobs.get(runningId) && !jobs.get(runningId).done) {
+      return { provider, mode: 'live', jobId: runningId, duplicate: true, providerJobRef: String(rawId) };
+    }
+
+    const { usable, checked } = await findUsable([...seen]);
+    const reuse = new Map();
+    const toProvider = [];
+    for (const e of entries) {
+      if (usable.has(e.normalized)) reuse.set(e.normalized, usable.get(e.normalized));
+      else toProvider.push(e);
+    }
+
+    const job = {
+      id: `cj_${randomUUID()}`,
+      provider,
+      mode: 'live',
+      adapter,
+      source,
+      entries,
+      reuse,
+      waiting: new Map(),
+      malformed: new Set(),
+      toProvider,
+      registryChecked: checked,
+      resolved: new Map(),
+      unresolved: new Map(),
+      providerRawId: String(rawId),
+      providerStatus: null,
+      providerResults: null,
+      providerDone: toProvider.length === 0,
+      creditsUsed: 0,
+      creditsRemaining: null,
+      save: { total: 0, saved: 0, failed: 0 },
+      done: false,
+      error: null,
+      errors: 0,
+      createdAt: Date.now(),
+      fingerprint: fp,
+    };
+    for (const e of toProvider) bulkOwners.set(e.normalized, job.id);
+    jobs.set(job.id, job);
+    fingerprints.set(fp, job.id);
+    schedule(job, 0);
+    return { provider, mode: 'live', jobId: job.id, duplicate: false, providerJobRef: job.providerRawId };
   }
 
   function releaseOwnership(job) {
@@ -434,6 +507,7 @@ export function createCentralVerification({ service, store, options = {}, timing
     verifySingle,
     preview,
     createBulkJob,
+    resumeBulkJob,
     isCentralJob: (id) => String(id).startsWith('cj_'),
     bulkStatus: async (id) => (String(id).startsWith('cj_') ? bulkStatus(id) : service.bulkStatus(id)),
     bulkResults: async (id) => (String(id).startsWith('cj_') ? bulkResults(id) : service.bulkResults(id)),

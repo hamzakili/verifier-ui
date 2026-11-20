@@ -1,12 +1,14 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { History as HistoryIcon, Search, Download, Trash2 } from 'lucide-react';
+import { History as HistoryIcon, Search, Download, Trash2, Layers } from 'lucide-react';
 import { useApp, entryProvider } from '../context/AppContext';
 import { useToast } from '../context/ToastContext';
 import ActivityTable from '../components/ActivityTable';
 import EmptyState from '../components/EmptyState';
+import { JobStatusPill } from '../components/bulk/StatusPill';
+import { api, downloadFromApi, downloadPaths } from '../lib/api';
 import { downloadCsv } from '../lib/csv';
-import { formatNumber } from '../lib/format';
+import { formatDateTime, formatNumber } from '../lib/format';
 import { STATUS_ORDER } from '../lib/status';
 
 const TYPE_TABS = [
@@ -121,7 +123,79 @@ export default function History() {
         )}
       </section>
       <p className="text-center text-xs text-slate-400">History is stored in this browser’s local storage (up to 500 entries).</p>
+
+      <BulkJobHistory />
     </div>
+  );
+}
+
+/** Finished bulk verification jobs (stored on the server, so they survive browser resets). */
+function BulkJobHistory() {
+  const toast = useToast();
+  const [state, setState] = useState({ loading: true, jobs: [], total: 0, error: null });
+  useEffect(() => {
+    let cancelled = false;
+    api.verificationJobs({ status: 'completed,completed_with_errors,cancelled,failed', limit: 10 }).then(
+      (r) => !cancelled && setState({ loading: false, jobs: r.jobs, total: r.meta.total, error: null }),
+      (err) => !cancelled && setState({ loading: false, jobs: [], total: 0, error: err.message }),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <section className="card overflow-hidden">
+      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
+        <h2 className="flex items-center gap-2 font-semibold text-slate-900"><Layers className="h-4 w-4 text-indigo-600" /> Bulk verification jobs</h2>
+        <Link to="/bulk-jobs" className="text-sm font-medium text-indigo-700 hover:underline">View all{state.total > state.jobs.length ? ` (${formatNumber(state.total)})` : ''}</Link>
+      </div>
+      {state.error ? (
+        <p className="px-4 py-3 text-sm text-red-700">{state.error}</p>
+      ) : !state.loading && !state.jobs.length ? (
+        <EmptyState icon={Layers} title="No finished bulk jobs yet" description="Jobs you run from Bulk Verification Jobs appear here when they finish." />
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-slate-100">
+            <thead className="bg-slate-50">
+              <tr>
+                <th className="th">Job name</th>
+                <th className="th text-right">Total leads</th>
+                <th className="th">Results</th>
+                <th className="th">Completed</th>
+                <th className="th">Destination</th>
+                <th className="th">Status</th>
+                <th className="th text-right">Download</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {state.jobs.map((j) => (
+                <tr key={j.id} className="hover:bg-slate-50/60">
+                  <td className="td"><Link to={`/bulk-jobs/${j.id}`} className="font-medium text-indigo-700 hover:underline">{j.job_name}</Link></td>
+                  <td className="td text-right tabular-nums">{formatNumber(j.total_eligible)}</td>
+                  <td className="td whitespace-nowrap text-xs">
+                    <span className="text-emerald-700">{formatNumber(j.counts.valid)} valid</span> · <span className="text-red-700">{formatNumber(j.counts.invalid)} invalid</span> ·{' '}
+                    <span className="text-slate-600">{formatNumber(j.counts.disposable + j.counts.catchall + j.counts.unknown)} other</span>
+                  </td>
+                  <td className="td whitespace-nowrap text-slate-500">{j.completed_at ? formatDateTime(j.completed_at) : '—'}</td>
+                  <td className="td max-w-[200px] truncate text-slate-600" title={j.destination_folder?.path}>{j.destination_folder?.folder_name ?? '—'}</td>
+                  <td className="td"><JobStatusPill status={j.status} /></td>
+                  <td className="td text-right">
+                    {j.files.some((f) => f.kind === 'all_results') ? (
+                      <button className="btn-ghost px-2 py-1" aria-label={`Download results of ${j.job_name}`} onClick={() => downloadFromApi(downloadPaths.job(j.id)).catch((e) => toast.error(e.message))}>
+                        <Download className="h-4 w-4" />
+                      </button>
+                    ) : (
+                      <span className="text-xs text-slate-400">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   );
 }
 

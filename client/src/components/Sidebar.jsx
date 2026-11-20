@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, MailCheck, FileSpreadsheet, History, X, MailSearch, Database } from 'lucide-react';
+import { LayoutDashboard, MailCheck, FileSpreadsheet, History, X, MailSearch, Database, Layers, FolderOpen } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { useBulk } from '../context/BulkContext';
 import ModeToggle from './ModeToggle';
@@ -9,9 +9,15 @@ export const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
   { to: '/single', label: 'Single Email Verifier', icon: MailCheck },
   { to: '/bulk', label: 'Bulk CSV Verifier', icon: FileSpreadsheet },
+  { to: '/bulk-jobs', label: 'Bulk Verification Jobs', icon: Layers },
   { to: '/history', label: 'Verification History', icon: History },
+  { to: '/files', label: 'Folders / Files', icon: FolderOpen },
   { to: '/registry', label: 'Email Registry', icon: Database },
 ];
+
+/** Nav item for a path, matched by whole path segments ("/bulk" must not match "/bulk-jobs"). */
+export const navItemFor = (pathname) =>
+  NAV_ITEMS.find((n) => (n.end ? pathname === n.to : pathname === n.to || pathname.startsWith(`${n.to}/`)));
 
 /** Shows whether the Email Registry API (Laravel) is reachable. */
 function CentralDbStatus() {

@@ -2,7 +2,14 @@
  * Reads and validates server configuration once at startup.
  * API keys are kept here and in the provider adapters only — never sent to the client.
  */
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PROVIDER_IDS, FALLBACK_DEFAULT_PROVIDER } from './providers/registry.js';
+
+const SERVER_DIR = fileURLToPath(new URL('..', import.meta.url));
+// Under `node --test` nothing is written to the real data/storage folders unless a test asks for it.
+const UNDER_TEST = Boolean(process.env.NODE_TEST_CONTEXT);
 
 const DEFAULT_MV_API_URL = 'https://api.millionverifier.com/api/v3/';
 const DEFAULT_MV_BULK_URL = 'https://bulkapi.millionverifier.com/bulkapi/v2/';
@@ -68,6 +75,13 @@ export function loadConfig(env = process.env) {
       maxAgeDays: positiveInt(env.EMAIL_REGISTRY_MAX_AGE_DAYS, 0, true),
       // Saves per minute; keep below the registry's API_RATE_LIMIT (Laravel default 120/min per IP).
       saveRatePerMinute: positiveInt(env.EMAIL_REGISTRY_SAVE_RATE_PER_MINUTE, 90),
+    },
+    // Bulk Verification Jobs: persistent job state (SQLite) and private result-file storage.
+    bulk: {
+      dbFile: (env.BULK_DB_FILE || '').trim() || (UNDER_TEST ? ':memory:' : join(SERVER_DIR, 'data', 'bulk-verification.sqlite')),
+      storageDir: (env.BULK_STORAGE_DIR || '').trim() || (UNDER_TEST ? join(tmpdir(), `verifier-bulk-test-${process.pid}`) : join(SERVER_DIR, 'storage', 'bulk-files')),
+      maxConcurrentJobs: positiveInt(env.BULK_MAX_CONCURRENT_JOBS, 1),
+      pollMs: positiveInt(env.BULK_POLL_MS, 3_000),
     },
     warnings,
   };
